@@ -5,6 +5,9 @@ import pandas as pd
 import streamlit as st
 from openai import OpenAI
 
+# Load API Keys from Streamlit Secrets
+OPENAI_API_KEY = st.secrets["OPENAI_API_KEY"]
+ATTOM_API_KEY = st.secrets["ATTOM_API_KEY"]
 
 client = OpenAI(api_key=OPENAI_API_KEY)
 
@@ -104,3 +107,4 @@ if st.button("Find Property"):
             df = pd.DataFrame(final_data.items(), columns=["Field", "Value"])
             st.success("✅ Data Verified Successfully")
             st.dataframe(df, use_container_width=True)
+
