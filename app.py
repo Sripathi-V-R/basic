@@ -41,11 +41,9 @@ def extract_with_openai(address: str):
 
     text = res.output_text
 
-    # Attempt to extract JSON safely
     try:
         return json.loads(text)
     except:
-        # Find JSON inside response if model included text before/after
         start = text.find("{")
         end = text.rfind("}") + 1
         cleaned = text[start:end]
@@ -107,4 +105,3 @@ if st.button("Find Property"):
             df = pd.DataFrame(final_data.items(), columns=["Field", "Value"])
             st.success("✅ Data Verified Successfully")
             st.dataframe(df, use_container_width=True)
-
