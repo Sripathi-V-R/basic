@@ -5,9 +5,6 @@ import pandas as pd
 import streamlit as st
 from openai import OpenAI
 
-# Load API Keys from Streamlit Secrets
-OPENAI_API_KEY = st.secrets["OPENAI_API_KEY"]
-ATTOM_API_KEY = st.secrets["ATTOM_API_KEY"]
 
 client = OpenAI(api_key=OPENAI_API_KEY)
 
@@ -28,10 +25,10 @@ def extract_with_openai(address: str):
 
     For this U.S. address: "{address}"
 
-    Return STRICT JSON with proper JSON syntax:
-    - Only those exact keys
+    Return STRICT JSON with correct JSON syntax:
+    - Use lowercase field names exactly as listed
     - Use null if unknown
-    - No additional text
+    - NO extra fields, text, comments or explanation
     """
 
     res = client.responses.create(
@@ -41,9 +38,11 @@ def extract_with_openai(address: str):
 
     text = res.output_text
 
+    # Attempt to extract JSON safely
     try:
         return json.loads(text)
     except:
+        # Find JSON inside response if model included text before/after
         start = text.find("{")
         end = text.rfind("}") + 1
         cleaned = text[start:end]
@@ -51,7 +50,10 @@ def extract_with_openai(address: str):
 
 def get_attom_data(address: str):
     url = "https://api.gateway.attomdata.com/propertyapi/v1.0.0/property/basicprofile"
-    headers = {"apikey": ATTOM_API_KEY, "accept": "application/json"}
+    headers = {
+        "apikey": ATTOM_API_KEY,
+        "accept": "application/json"
+    }
     params = {"address": address}
 
     r = requests.get(url, headers=headers, params=params)
@@ -82,7 +84,7 @@ def merge_data(ai_data, attom_data):
     final = {}
     for key in FIELDS:
         value = ai_data.get(key)
-        if not value:
+        if not value or value in ["", None]:
             value = attom_data.get(key)
         final[key] = value
     return final
