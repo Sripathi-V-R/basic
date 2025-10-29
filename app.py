@@ -13,7 +13,7 @@ client = OpenAI(api_key=OPENAI_API_KEY)
 
 # UI
 st.set_page_config(page_title="Revalix", page_icon="🏠", layout="centered")
-st.title("🏠 Revalix Property Info Finder")
+st.title("Property Info Finder")
 st.write("Enter a U.S. property address to fetch verified property data.")
 
 FIELDS = [
@@ -137,7 +137,7 @@ if st.button("Find Property"):
 
         st.info(f"📍 Corrected Address: **{corrected}**")
 
-        with st.spinner("📡 Contacting ATTOM API..."):
+        with st.spinner("finding..."):
             attom = get_attom_data(corrected)
             ai = extract_with_openai(corrected)
             final = merge_data(ai, attom)
@@ -145,3 +145,4 @@ if st.button("Find Property"):
         df = pd.DataFrame(final.items(), columns=["Field", "Value"])
         st.success("✅ Data Verified Successfully")
         st.dataframe(df, use_container_width=True)
+
