@@ -4,5 +4,8 @@ requests
 python-dotenv
 openai>=1.0.0
 webdriver-manager
-selenium
+selenium==4.20.0
+chromedriver-autoinstaller
+
+
 
