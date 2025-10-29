@@ -21,24 +21,36 @@ from webdriver_manager.chrome import ChromeDriverManager
 
 
 # =========================================
-# Setup
+# ✅ API Key Load (Supports .env + Streamlit Cloud)
 # =========================================
 load_dotenv()
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-ATTOM_API_KEY = os.getenv("ATTOM_API_KEY")
+
+if "OPENAI_API_KEY" in st.secrets:
+    OPENAI_API_KEY = st.secrets["OPENAI_API_KEY"]
+else:
+    OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+
+if "ATTOM_API_KEY" in st.secrets:
+    ATTOM_API_KEY = st.secrets["ATTOM_API_KEY"]
+else:
+    ATTOM_API_KEY = os.getenv("ATTOM_API_KEY")
+
 client = OpenAI(api_key=OPENAI_API_KEY)
 
-st.set_page_config(page_title="Revalix+ (HCAD-powered)", page_icon="🏠", layout="wide")
+
+# =========================================
+# ✅ Streamlit UI Setup
+# =========================================
+st.set_page_config(page_title="Revalix+ (HCAD)", page_icon="🏠", layout="wide")
 st.title("🏠 Revalix+ — Property Intelligence (ATTOM + HCAD + OpenAI)")
 
-# Global field configuration
+# ✅ Field Configurations
 IDENTIFICATION_FIELDS = [
     "Property ID", "Property Name", "Owner Name",
     "Property Type", "Property Subtype",
     "Ownership Type", "Occupancy Status",
     "Building Code / Permit ID"
 ]
-
 LOCATION_FIELDS = [
     "Address Line 1", "Street Name", "City", "County", "Township",
     "State", "Postal Code", "Latitude", "Longitude", "Facing Direction",
@@ -47,12 +59,11 @@ LOCATION_FIELDS = [
     "Map Facet", "Key Map", "Tax District", "Tax Code", "Location Type",
     "Country"
 ]
-
 ALL_FIELDS = IDENTIFICATION_FIELDS + LOCATION_FIELDS
 
 
 # =========================================
-# Utilities
+# ✅ Utility Functions
 # =========================================
 def extract_json_safe(text: str, fallback=None):
     match = re.search(r"\{.*\}", text, re.S)
@@ -66,31 +77,32 @@ def extract_json_safe(text: str, fallback=None):
 
 def normalize_address(address: str) -> str:
     prompt = f"""
-    Return only pure JSON:
-    {{
-      "corrected_address": "<USPS-style full address>"
-    }}
-    Address: "{address}"
+    Return only JSON:
+    {{"corrected_address": "<FULL USPS FORMAT>"}}
+    Input: "{address}"
     """
     res = client.responses.create(model="gpt-4.1-mini", input=prompt)
-    data = extract_json_safe(res.output_text, {"corrected_address": address})
-    return data.get("corrected_address", address)
+    d = extract_json_safe(res.output_text, {"corrected_address": address})
+    return d.get("corrected_address", address)
 
 
 def enforce_user_zip(original: str, corrected: str) -> str:
-    orig_zip = re.findall(r"\b\d{5}\b", original or "")
-    corr_zip = re.findall(r"\b\d{5}\b", corrected or "")
+    orig_zip = re.findall(r"\b\d{5}\b", original)
+    corr_zip = re.findall(r"\b\d{5}\b", corrected)
     if orig_zip and corr_zip and orig_zip[0] != corr_zip[0]:
         corrected = corrected.replace(corr_zip[0], orig_zip[0])
-        st.warning(f"ZIP overridden to user input: {orig_zip[0]}")
+        st.info(f"ZIP reset to: {orig_zip[0]}")
     return corrected
 
 
-def fetch_attom(address: str) -> dict:
+# =========================================
+# ✅ ATTOM Lookup
+# =========================================
+def fetch_attom(address: str):
     try:
         street, rest = address.split(",", 1)
         city, st_zip = rest.rsplit(",", 1)
-        state, zipcode = st_zip.strip().split()
+        state, zipcode = st_zip.split()
     except:
         return {}
 
@@ -98,14 +110,14 @@ def fetch_attom(address: str) -> dict:
     headers = {"apikey": ATTOM_API_KEY}
     params = {"address1": street.strip(),
               "address2": f"{city.strip()}, {state} {zipcode}"}
-    r = requests.get(url, headers=headers, params=params, timeout=60)
 
-    props = r.json().get("property", [])
-    if not props:
-        return {}
+    r = requests.get(url, headers=headers, params=params)
+    p_list = r.json().get("property", [])
+    if not p_list: return {}
 
-    p = props[0]
-    out = {
+    p = p_list[0]
+
+    return {
         "apn": p.get("identifier", {}).get("apn"),
         "street_name": p.get("address", {}).get("line1"),
         "city": p.get("address", {}).get("locality"),
@@ -117,376 +129,240 @@ def fetch_attom(address: str) -> dict:
         "property_type": p.get("summary", {}).get("propSubType"),
         "property_sub_type": p.get("summary", {}).get("propType"),
         "owner_name": (p.get("owner1", {}) or {}).get("name"),
-        "country": "USA"  # always USA
+        "country": "USA"
     }
-    return out
 
 
-# ======================================
-# HCAD Scraping + GPT Structuring Engine
-# ======================================
+# =========================================
+# ✅ HCAD Scraper + Table Structuring (Smart AI)
+# =========================================
 JUNK_PATTERNS = [
-    r"\bPrint\b", r"\bEmail\b", r"\bFeedback\b", r"\bShare\b",
-    r"\bLegend\b", r"\bLayers?\b", r"\bBasemap\b", r"\bMap Tools?\b",
-    r"\bZoom In\b", r"\bZoom Out\b", r"\bMeasure\b", r"\bHelp\b",
-    r"©.*?\d{4}", r"\bEsri\b", r"\bOpen ?Government\b", r"\bSign In\b",
-    r"\bPrivacy\b", r"\bTerms\b", r"\bAbout\b"
+    r"Print|Email|Share|Legend|Layers?|Basemap|Map Tools?|Zoom|Measure|Help",
+    r"©.*", r"Esri", r"Sign In|Privacy|Terms|Feedback"
 ]
 
-def clean_garbage(text: str) -> str:
+
+def clean_garbage(text):
     for pat in JUNK_PATTERNS:
-        text = re.sub(pat, "", text, flags=re.IGNORECASE)
-    # collapse extra whitespace
-    text = re.sub(r"[ \t]+\n", "\n", text)
-    text = re.sub(r"\n{3,}", "\n\n", text)
-    return text.strip()
+        text = re.sub(pat, "", text, flags=re.I)
+
+    return re.sub(r"\n{3,}", "\n\n", text).strip()
 
 
 def scrape_hcad_and_structure(apn: str):
     URL = "https://arcweb.hcad.org/parcel-viewer-v2.0/"
     chrome_options = Options()
-    chrome_options.add_argument("--start-maximized")
-    chrome_options.add_argument("--disable-popup-blocking")
-    driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()),
-                              options=chrome_options)
-    wait = WebDriverWait(driver, 60)
+    chrome_options.add_argument("--headless=new")
+    chrome_options.add_argument("--disable-gpu")
+    chrome_options.add_argument("--disable-dev-shm-usage")
+    chrome_options.add_argument("--no-sandbox")
+    driver = webdriver.Chrome(
+        service=Service(ChromeDriverManager().install()),
+        options=chrome_options
+    )
+    wait = WebDriverWait(driver, 50)
 
     try:
         driver.get(URL)
-        time.sleep(6)
+        time.sleep(5)
         try:
-            close = wait.until(EC.element_to_be_clickable((By.XPATH, '//*[@id="mySurveyModal"]/div/span')))
-            driver.execute_script("arguments[0].click();", close)
-        except:
-            pass
+            btn = wait.until(EC.element_to_be_clickable((By.XPATH, '//*[@id="mySurveyModal"]/div/span')))
+            btn.click()
+        except: pass
 
         i = wait.until(EC.visibility_of_element_located((By.CSS_SELECTOR, "input.esri-input")))
-        i.clear()
         i.send_keys(apn)
 
-        search_btn = wait.until(EC.element_to_be_clickable(
-            (By.XPATH, "//button[contains(@class,'esri-search__submit-button')]")))
-        driver.execute_script("arguments[0].click();", search_btn)
-
+        btn = wait.until(EC.element_to_be_clickable((By.XPATH, "//button[contains(@class,'esri-search__submit-button')]")))
+        btn.click()
         wait.until(EC.visibility_of_element_located((By.CSS_SELECTOR, ".esri-popup__main-container")))
-        link = wait.until(EC.element_to_be_clickable(
-            (By.CSS_SELECTOR, "#popupTable tbody tr:nth-child(1) td:nth-child(2) a")))
-        driver.execute_script("arguments[0].click();", link)
-        time.sleep(3)
+
+        link = wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR, "#popupTable tbody tr td a")))
+        link.click()
+        time.sleep(5)
 
         driver.switch_to.window(driver.window_handles[-1])
-        time.sleep(6)
+        time.sleep(5)
 
-        # Scroll to load all content
-        last_h = 0
-        while True:
-            driver.execute_script("window.scrollBy(0,2000);")
+        for _ in range(7):
+            driver.execute_script("window.scrollBy(0,3000);")
             time.sleep(1)
-            new_h = driver.execute_script("return document.body.scrollHeight")
-            if new_h == last_h:
-                break
-            last_h = new_h
 
         raw = driver.execute_script("return document.body.innerText;")
+
     finally:
-        try:
-            driver.quit()
-        except:
-            pass
+        driver.quit()
 
     raw = clean_garbage(raw)
 
-    # Smarter GPT instruction for meaningful, normalized tables
     prompt = f"""
-You are a real estate data structuring AI.
+You extract useful real estate property data.
 
-Input: Raw text from HCAD property page. It contains valuable data mixed with website UI text.
-Your job:
-- REMOVE ALL UI/website noise (buttons, credits, menus, social, logos).
-- DETECT the real property sections, such as:
-  Ownership Information, Situs/Property Address, Mailing Address, Legal Description,
-  Land, Building/Improvements, Structures, Valuations, Jurisdictions, Exemptions,
-  Sales/Deed History, Tax Info, Notes, Miscellaneous.
+Remove ALL GIS/website UI garbage. Only extract real data.
 
-OUTPUT RULES:
-- For each section output a header: ## <SECTION TITLE>
-- Below it, a table with EXACTLY two columns: Field | Value
-- Use clean, human-friendly field names (standardize cryptic labels).
-- Split multi-values into separate rows.
-- No duplicate rows. No blank rows. No UI garbage. Do not summarize.
+Group data into meaningful sections like:
+Ownership, Situs Address, Mailing Address, Legal Description, Improvements/Structures,
+Valuations, Land, Jurisdictions, Exemptions, Sales History, Tax Info, Notes.
 
-Now transform the following text:
+Output Format:
+## SECTION NAME
+| Field | Value |
+|------|------|
+...data...
 
+No missing fields left unstructured.
+
+RAW:
 \"\"\"{raw}\"\"\"
 """
-    res = client.responses.create(
+
+    resp = client.responses.create(
         model="gpt-4.1-mini",
         input=prompt
     )
-    structured = res.output_text.strip()
-    return raw, structured
+
+    return resp.output_text.strip()
 
 
-# ======================================
-# Markdown → DataFrame + flatten
-# ======================================
-def markdown_table_to_df(md_table: str):
-    if "|" not in md_table:
+# =========================================
+# ✅ Markdown Parsing
+# =========================================
+def markdown_table_to_df(md):
+    if "|" not in md:
         return None
+    lines = [ln for ln in md.splitlines() if "---" not in ln]
     try:
-        # remove alignment rows like |---|---|
-        cleaned = [ln for ln in md_table.splitlines()
-                   if not re.match(r"^\s*\|?\s*[:-]+", ln)]
-        df = pd.read_csv(StringIO("\n".join(cleaned)),
-                         sep="|", engine="python", dtype=str, header=0)
+        df = pd.read_csv(StringIO("\n".join(lines)),
+                         sep="|", engine="python", header=0, dtype=str)
         df = df.dropna(axis=1, how="all")
         df.columns = [c.strip() for c in df.columns]
-        for c in df.columns:
-            df[c] = df[c].fillna("").str.strip()
-        # Always collapse to Field|Value
-        if len(df.columns) > 2:
-            df["Value"] = df[df.columns[1:]].agg(" | ".join, axis=1)
-            df = df[[df.columns[0], "Value"]]
-        elif len(df.columns) == 1:
-            df["Value"] = ""
-        df = df.rename(columns={df.columns[0]: "Field"})[["Field", "Value"]]
+        df = df.rename(columns={df.columns[0]: "Field", df.columns[-1]: "Value"})[["Field","Value"]]
         df = df[df["Field"] != ""]
-        return df.reset_index(drop=True)
+        return df
     except:
         return None
 
 
-def parse_structured_sections(structured_md: str):
+def parse_structured_sections(md):
     sections = {}
     flat = {}
-    blocks = re.split(r"^##\s+", structured_md, flags=re.MULTILINE)
+    blocks = re.split(r"^##\s+", md, flags=re.M)
     for b in blocks:
-        if not b.strip():
-            continue
+        if not b.strip(): continue
         lines = b.splitlines()
-        name = lines[0].strip()
-        md = "\n".join(lines[1:]).strip()
-        df = markdown_table_to_df(md)
-        if df is not None and not df.empty:
-            # flatten
-            for _, row in df.iterrows():
-                flat[row["Field"]] = row["Value"]
-            sections[name] = df
+        sec = lines[0].strip()
+        tbl = "\n".join(lines[1:]).strip()
+        df = markdown_table_to_df(tbl)
+        if df is None: continue
+        for _, r in df.iterrows():
+            flat[r["Field"]] = r["Value"]
+        sections[sec] = df
     return sections, flat
 
 
-# ======================================
-# AI helpers (fill/normalize)
-# ======================================
-def ai_fill_missing(context, keys):
-    prompt = {
-        "task": "Fill only missing. If unknown return null.",
-        "fields": keys,
-        "context": context
-    }
-    res = client.responses.create(model="gpt-4.1-mini", input=json.dumps(prompt))
-    return extract_json_safe(res.output_text)
+# =========================================
+# ✅ AI Fill + Normalize
+# =========================================
+def ai_fill_missing(ctx, keys):
+    prompt = {"fields": keys, "context": ctx}
+    r = client.responses.create(model="gpt-4.1-mini", input=json.dumps(prompt))
+    return extract_json_safe(r.output_text, {})
 
 
-def normalize_field_names_with_ai(scraped_fields_dict: dict) -> dict:
-    """
-    Ask AI to map raw scraped keys to standardized field names.
-    Returns a new dict with normalized keys.
-    """
-    prompt = {
-        "task": "Map each key to a clean, standardized field name for appraisal tables.",
-        "raw_keys": list(scraped_fields_dict.keys()),
-        "return_format": "JSON mapping of raw_key -> normalized_key"
-    }
-    res = client.responses.create(model="gpt-4.1-mini", input=json.dumps(prompt))
-    mapping = extract_json_safe(res.output_text, {})
-    rebuilt = {}
-    for k, v in scraped_fields_dict.items():
-        rebuilt[mapping.get(k, k)] = v
-    return rebuilt
+def final_ai_fix(idn, loc, n_addr, apn, attom, scraped):
+    missing = [k for k in idn if not idn[k]] + [k for k in loc if not loc[k]]
+    if not missing: return idn, loc
 
-
-def final_ai_fix(identification, location, address, apn, attom, scraped):
-    missing_keys = [k for k in identification if not identification[k]] + \
-                   [k for k in location if not location[k]]
-
-    if not missing_keys:
-        return identification, location
-
-    payload = {
-        "task": "Fill only these fields; if unknown, return null.",
-        "address": address,
+    req = {
+        "address": n_addr,
         "apn": apn,
         "attom": attom,
         "scraped": scraped,
-        "fields_requested": missing_keys
+        "fields": missing
     }
-    res = client.responses.create(model="gpt-4.1-mini",
-                                  input=json.dumps(payload))
-    fix = extract_json_safe(res.output_text, {})
+    r = client.responses.create(model="gpt-4.1-mini", input=json.dumps(req))
+    fix = extract_json_safe(r.output_text, {})
 
-    # apply only where missing; then remove nulls
-    for d in [identification, location]:
+    for d in [idn, loc]:
         for k in list(d.keys()):
             if not d[k]:
                 v = fix.get(k)
-                if v and str(v).strip().lower() != "null":
-                    d[k] = v
-                else:
-                    d.pop(k)
-    return identification, location
+                if v: d[k] = v
+                else: d.pop(k)
+    return idn, loc
 
 
-# ======================================
-# BUILD TABLES (merge with priority)
-# ======================================
-def build_identification(attom, scraped, ai, harris):
-    out = {f: None for f in IDENTIFICATION_FIELDS}
-
-    def g(*xs):
-        for x in xs:
-            if scraped and scraped.get(x):
-                return scraped[x]
-        return None
-
-    out["Property ID"] = g("Account Number", "APN", "Property ID") or attom.get("apn") or ai.get("Property ID")
-    out["Owner Name"] = g("Owner", "Owner Name") or attom.get("owner_name") or ai.get("Owner Name")
-    out["Property Type"] = g("Property Type") or attom.get("property_type") or ai.get("Property Type")
-    out["Property Subtype"] = g("Property Subtype") or attom.get("property_sub_type") or ai.get("Property Subtype")
-
-    if harris:
-        out["Ownership Type"] = g("Ownership", "Ownership Type") or ai.get("Ownership Type")
-        out["Occupancy Status"] = g("Occupancy", "Occupancy Status") or ai.get("Occupancy Status")
-        out["Building Code / Permit ID"] = g("Permit", "Permit ID", "Building Permit") or ai.get("Building Code / Permit ID")
-
+# =========================================
+# ✅ Build Identification + Location
+# =========================================
+def merge_fields(attom, scraped, ai, fields):
+    out = {}
+    for f in fields:
+        out[f] = scraped.get(f) if scraped and f in scraped else \
+                  attom.get(f.lower()) if attom and f.lower() in attom else \
+                  ai.get(f)
     return out
 
 
-def build_location(attom, scraped, ai, harris):
-    out = {f: None for f in LOCATION_FIELDS}
+# =========================================
+# ✅ Streamlit Form (ENTER to RUN)
+# =========================================
+with st.form("search", clear_on_submit=False):
+    address = st.text_input("Enter Address", placeholder="123 Main St, City ST ZIP")
+    submit = st.form_submit_button("Run (Press Enter)")
 
-    def g(*xs):
-        for x in xs:
-            if scraped and scraped.get(x):
-                return scraped[x]
-        return None
+if submit and address.strip():
+    with st.spinner("Normalize..."):
+        n_addr = normalize_address(address)
+        n_addr = enforce_user_zip(address, n_addr)
 
-    # ATTOM base
-    out["Address Line 1"] = attom.get("street_name")
-    out["Street Name"] = attom.get("street_name")
-    out["City"] = attom.get("city")
-    out["County"] = attom.get("county")
-    out["State"] = attom.get("state")
-    out["Postal Code"] = attom.get("zipcode")
-    out["Latitude"] = attom.get("latitude")
-    out["Longitude"] = attom.get("longitude")
-    out["Country"] = "USA"
-
-    if harris:
-        out["Legal Description"] = g("Legal Description", "Legal")
-        out["Neighborhood Name"] = g("Neighborhood Name", "Neighborhood")
-        out["State Class Code"] = g("State Class Code", "State Class")
-        out["Tax District"] = g("Tax District")
-        out["Tax Code"] = g("Tax Code")
-        # override situs details if present
-        out["Address Line 1"] = g("Situs Address", "Site Address") or out["Address Line 1"]
-        out["City"] = g("City") or out["City"]
-        out["Postal Code"] = g("Zip", "ZIP") or out["Postal Code"]
-
-    # Fill any remaining from AI
-    for k, v in out.items():
-        if not v and ai:
-            out[k] = ai.get(k)
-    out["Country"] = "USA"
-    return out
-
-
-# ======================================
-# Show HCAD tables
-# ======================================
-def render_sections_area(md: str):
-    st.markdown("### 📌 Additional Data From County Site")
-    sections, _ = parse_structured_sections(md)
-    for sec, df in sections.items():
-        df.index = df.index + 1
-        df.index.name = "S.No"
-        st.markdown(f"#### 🔸 {sec}")
-        st.dataframe(df, use_container_width=True)
-
-
-# ======================================
-# FORM (Enter to Run)
-# ======================================
-with st.form("search_form", clear_on_submit=False):
-    address_input = st.text_input("Enter Address", placeholder="e.g., 8633 Eldridge Pkwy, Houston TX 77083")
-    submitted = st.form_submit_button("Run (Press Enter ↵)")
-
-if submitted:
-    if not address_input.strip():
-        st.error("Address required.")
-        st.stop()
-
-    with st.spinner("1️⃣ Normalize address..."):
-        normalized = normalize_address(address_input)
-        normalized = enforce_user_zip(address_input, normalized)
-
-    with st.spinner("2️⃣ Fetch ATTOM data..."):
-        attom = fetch_attom(normalized)
+    with st.spinner("Lookup ATTOM..."):
+        attom = fetch_attom(n_addr)
 
     if not attom.get("apn"):
-        st.error("APN not found in ATTOM.")
+        st.error("APN not found. Try a full address.")
         st.stop()
 
-    county = (attom.get("county") or "").strip().lower()
+    county = attom.get("county", "").lower()
     apn = attom["apn"]
-    scraped_flat, structured_md = None, None
+    scraped_sections = {}
+    scraped_flat = {}
 
     if county == "harris":
-        with st.spinner("3️⃣ Harris County detected — Scraping & structuring HCAD..."):
-            _, structured_md = scrape_hcad_and_structure(apn)
-        # Parse and flatten
-        sections, scraped_flat = parse_structured_sections(structured_md)
-        # Normalize scraped field names with AI for better merging
-        with st.spinner("🧠 Normalizing scraped field names..."):
-            scraped_flat = normalize_field_names_with_ai(scraped_flat)
+        with st.spinner("Scraping HCAD + AI Structuring..."):
+            structured_md = scrape_hcad_and_structure(apn)
+        scraped_sections, scraped_flat = parse_structured_sections(structured_md)
 
-    # Pre-fill AI for missing fields (context)
-    with st.spinner("4️⃣ AI pre-fill (missing only)..."):
-        ai_data = ai_fill_missing(
-            {"address": normalized, "apn": apn, "attom": attom, "scraped": scraped_flat},
-            ALL_FIELDS
-        )
+    with st.spinner("AI Fill..."):
+        ai_data = ai_fill_missing({"address": n_addr, "attom": attom, "scraped": scraped_flat}, ALL_FIELDS)
 
-    harris = (county == "harris") and (structured_md is not None)
+    harris = bool(scraped_sections)
 
-    with st.spinner("5️⃣ Merge data with priority..."):
-        identification = build_identification(attom, scraped_flat, ai_data, harris)
-        location = build_location(attom, scraped_flat, ai_data, harris)
+    with st.spinner("Merge..."):
+        identification = merge_fields(attom, scraped_flat, ai_data, IDENTIFICATION_FIELDS)
+        location = merge_fields(attom, scraped_flat, ai_data, LOCATION_FIELDS)
 
-    # Final AI fix & remove null fields
-    with st.spinner("6️⃣ Final AI fix & cleanup..."):
-        identification, location = final_ai_fix(
-            identification, location,
-            normalized, apn, attom, scraped_flat
-        )
+    with st.spinner("Final AI Clean..."):
+        identification, location = final_ai_fix(identification, location, n_addr, apn, attom, scraped_flat)
 
-    # UI Tabs
-    tab1, tab2 = st.tabs(["🆔 Identification", "📍 Location"])
-
-    with tab1:
+    # ✅ UI: Tabs
+    t1, t2 = st.tabs(["🆔 Identification", "📍 Location"])
+    with t1:
         df = pd.DataFrame(identification.items(), columns=["Field", "Value"])
-        df.index = df.index + 1
-        df.index.name = "S.No"
+        df.index += 1; df.index.name = "S.No"
         st.dataframe(df, use_container_width=True)
 
-    with tab2:
+    with t2:
         df = pd.DataFrame(location.items(), columns=["Field", "Value"])
-        df.index = df.index + 1
-        df.index.name = "S.No"
+        df.index += 1; df.index.name = "S.No"
         st.dataframe(df, use_container_width=True)
 
     if harris:
         st.markdown("---")
-        render_sections_area(structured_md)
+        st.subheader("📌 Additional County Data")
+        for sec, df in scraped_sections.items():
+            df.index += 1; df.index.name = "S.No"
+            st.markdown(f"#### 🔸 {sec}")
+            st.dataframe(df, use_container_width=True)
     else:
-        st.info("ℹ️ Non-Harris: Only ATTOM + AI-based Identification & Location shown.")
+        st.info("ℹ️ Not Harris County — ATTOM + AI only.")
