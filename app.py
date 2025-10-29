@@ -31,7 +31,7 @@ client = OpenAI(api_key=OPENAI_API_KEY)
 st.set_page_config(page_title="Revalix+ (HCAD-powered)", page_icon="🏠", layout="wide")
 st.title("🏠 Revalix+ — Property Intelligence (ATTOM + HCAD + OpenAI)")
 
-# Global fields (Identification + Location — “all fields” superset)
+# Global field configuration
 IDENTIFICATION_FIELDS = [
     "Property ID", "Property Name", "Owner Name",
     "Property Type", "Property Subtype",
@@ -44,7 +44,8 @@ LOCATION_FIELDS = [
     "State", "Postal Code", "Latitude", "Longitude", "Facing Direction",
     "Neighborhood Type", "Landmark", "Legal Description", "Census Tract",
     "Market", "Submarket", "CBSA", "State Class Code", "Neighborhood Name",
-    "Map Facet", "Key Map", "Tax District", "Tax Code", "Location Type"
+    "Map Facet", "Key Map", "Tax District", "Tax Code", "Location Type",
+    "Country"
 ]
 
 ALL_FIELDS = IDENTIFICATION_FIELDS + LOCATION_FIELDS
@@ -53,24 +54,17 @@ ALL_FIELDS = IDENTIFICATION_FIELDS + LOCATION_FIELDS
 # =========================================
 # Utilities
 # =========================================
-def extract_json_safe(text: str, fallback: dict | None = None) -> dict:
-    """
-    Extracts the first JSON object from the text and parses it.
-    Returns fallback (or {}) if parsing fails.
-    """
+def extract_json_safe(text: str, fallback=None):
     match = re.search(r"\{.*\}", text, re.S)
     if match:
         try:
             return json.loads(match.group(0))
-        except Exception:
-            pass
+        except:
+            return fallback or {}
     return fallback or {}
 
 
 def normalize_address(address: str) -> str:
-    """
-    Step 1: Normalize address via OpenAI (strict JSON).
-    """
     prompt = f"""
     Return only pure JSON:
     {{
@@ -84,42 +78,33 @@ def normalize_address(address: str) -> str:
 
 
 def enforce_user_zip(original: str, corrected: str) -> str:
-    """
-    Keeps user's typed ZIP if both have ZIPs and they differ.
-    """
     orig_zip = re.findall(r"\b\d{5}\b", original or "")
     corr_zip = re.findall(r"\b\d{5}\b", corrected or "")
     if orig_zip and corr_zip and orig_zip[0] != corr_zip[0]:
-        corrected = re.sub(r"\b\d{5}\b", orig_zip[0], corrected, count=1)
+        corrected = corrected.replace(corr_zip[0], orig_zip[0])
         st.warning(f"ZIP overridden to user input: {orig_zip[0]}")
     return corrected
 
 
 def fetch_attom(address: str) -> dict:
-    """
-    Step 2: ATTOM fetch APN + County + core attributes.
-    """
     try:
         street, rest = address.split(",", 1)
         city, st_zip = rest.rsplit(",", 1)
         state, zipcode = st_zip.strip().split()
-    except Exception:
+    except:
         return {}
 
     url = "https://api.gateway.attomdata.com/propertyapi/v1.0.0/property/basicprofile"
-    headers = {"apikey": ATTOM_API_KEY, "accept": "application/json"}
+    headers = {"apikey": ATTOM_API_KEY}
     params = {"address1": street.strip(),
               "address2": f"{city.strip()}, {state} {zipcode}"}
     r = requests.get(url, headers=headers, params=params, timeout=60)
 
-    if r.status_code != 200:
+    props = r.json().get("property", [])
+    if not props:
         return {}
 
-    properties = r.json().get("property", [])
-    if not properties:
-        return {}
-
-    p = properties[0]
+    p = props[0]
     out = {
         "apn": p.get("identifier", {}).get("apn"),
         "street_name": p.get("address", {}).get("line1"),
@@ -127,24 +112,37 @@ def fetch_attom(address: str) -> dict:
         "county": p.get("area", {}).get("countrySecSubd"),
         "state": p.get("address", {}).get("countrySubd"),
         "zipcode": p.get("address", {}).get("postal1"),
-        "country": p.get("address", {}).get("country"),
         "latitude": p.get("location", {}).get("latitude"),
         "longitude": p.get("location", {}).get("longitude"),
         "property_type": p.get("summary", {}).get("propSubType"),
         "property_sub_type": p.get("summary", {}).get("propType"),
-        # sometimes available:
         "owner_name": (p.get("owner1", {}) or {}).get("name"),
+        "country": "USA"  # always USA
     }
     return out
 
 
-# ---------- HCAD scraping and structuring ----------
-def scrape_hcad_and_structure(apn: str) -> tuple[str, str]:
-    """
-    Step 3 (Harris only): Scrape HCAD parcel site by APN, scroll fully,
-    then send full text to OpenAI to structure into Markdown tables.
-    Returns (raw_text, structured_markdown).
-    """
+# ======================================
+# HCAD Scraping + GPT Structuring Engine
+# ======================================
+JUNK_PATTERNS = [
+    r"\bPrint\b", r"\bEmail\b", r"\bFeedback\b", r"\bShare\b",
+    r"\bLegend\b", r"\bLayers?\b", r"\bBasemap\b", r"\bMap Tools?\b",
+    r"\bZoom In\b", r"\bZoom Out\b", r"\bMeasure\b", r"\bHelp\b",
+    r"©.*?\d{4}", r"\bEsri\b", r"\bOpen ?Government\b", r"\bSign In\b",
+    r"\bPrivacy\b", r"\bTerms\b", r"\bAbout\b"
+]
+
+def clean_garbage(text: str) -> str:
+    for pat in JUNK_PATTERNS:
+        text = re.sub(pat, "", text, flags=re.IGNORECASE)
+    # collapse extra whitespace
+    text = re.sub(r"[ \t]+\n", "\n", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+
+def scrape_hcad_and_structure(apn: str):
     URL = "https://arcweb.hcad.org/parcel-viewer-v2.0/"
     chrome_options = Options()
     chrome_options.add_argument("--start-maximized")
@@ -155,227 +153,222 @@ def scrape_hcad_and_structure(apn: str) -> tuple[str, str]:
 
     try:
         driver.get(URL)
-        time.sleep(7)
-
-        # Close modal if present
+        time.sleep(6)
         try:
-            btn = wait.until(EC.element_to_be_clickable((By.XPATH, '//*[@id="mySurveyModal"]/div/span')))
-            driver.execute_script("arguments[0].click();", btn)
-        except Exception:
+            close = wait.until(EC.element_to_be_clickable((By.XPATH, '//*[@id="mySurveyModal"]/div/span')))
+            driver.execute_script("arguments[0].click();", close)
+        except:
             pass
 
-        # Enter APN in search
-        search_input = wait.until(EC.visibility_of_element_located((By.CSS_SELECTOR, "input.esri-input")))
-        search_input.clear()
-        search_input.send_keys(apn)
+        i = wait.until(EC.visibility_of_element_located((By.CSS_SELECTOR, "input.esri-input")))
+        i.clear()
+        i.send_keys(apn)
 
-        # Robust search click
         search_btn = wait.until(EC.element_to_be_clickable(
             (By.XPATH, "//button[contains(@class,'esri-search__submit-button')]")))
         driver.execute_script("arguments[0].click();", search_btn)
 
-        # Wait popup -> click APN link
         wait.until(EC.visibility_of_element_located((By.CSS_SELECTOR, ".esri-popup__main-container")))
         link = wait.until(EC.element_to_be_clickable(
             (By.CSS_SELECTOR, "#popupTable tbody tr:nth-child(1) td:nth-child(2) a")))
         driver.execute_script("arguments[0].click();", link)
         time.sleep(3)
 
-        # Switch new tab
         driver.switch_to.window(driver.window_handles[-1])
         time.sleep(6)
 
         # Scroll to load all content
         last_h = 0
         while True:
-            driver.execute_script("window.scrollBy(0, 1750);")
-            time.sleep(1.2)
+            driver.execute_script("window.scrollBy(0,2000);")
+            time.sleep(1)
             new_h = driver.execute_script("return document.body.scrollHeight")
             if new_h == last_h:
                 break
             last_h = new_h
 
-        time.sleep(2)
-        raw_text = driver.execute_script("return document.body.innerText;")
-
+        raw = driver.execute_script("return document.body.innerText;")
     finally:
         try:
             driver.quit()
-        except Exception:
+        except:
             pass
 
-    # Structure with OpenAI: strict “Field | Value” per section
+    raw = clean_garbage(raw)
+
+    # Smarter GPT instruction for meaningful, normalized tables
     prompt = f"""
-    You will receive raw text from a county property page (HCAD).
-    Convert EVERYTHING into Markdown by sections.
+You are a real estate data structuring AI.
 
-    Rules:
-    - For each logical section, start with: ## <SECTION NAME>
-    - Immediately after, a 2-column table with headers: Field | Value
-    - Include every data point; no summarizing or omissions.
-    - Split list values into separate rows.
-    - Preserve exact numbers and text.
+Input: Raw text from HCAD property page. It contains valuable data mixed with website UI text.
+Your job:
+- REMOVE ALL UI/website noise (buttons, credits, menus, social, logos).
+- DETECT the real property sections, such as:
+  Ownership Information, Situs/Property Address, Mailing Address, Legal Description,
+  Land, Building/Improvements, Structures, Valuations, Jurisdictions, Exemptions,
+  Sales/Deed History, Tax Info, Notes, Miscellaneous.
 
-    Raw:
-    \"\"\"{raw_text}\"\"\"
-    """
-    resp = client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[{"role": "system", "content": "You convert text to complete, lossless tables."},
-                  {"role": "user", "content": prompt}],
-        temperature=0.0,
+OUTPUT RULES:
+- For each section output a header: ## <SECTION TITLE>
+- Below it, a table with EXACTLY two columns: Field | Value
+- Use clean, human-friendly field names (standardize cryptic labels).
+- Split multi-values into separate rows.
+- No duplicate rows. No blank rows. No UI garbage. Do not summarize.
+
+Now transform the following text:
+
+\"\"\"{raw}\"\"\"
+"""
+    res = client.responses.create(
+        model="gpt-4.1-mini",
+        input=prompt
     )
-    structured_md = resp.choices[0].message.content.strip()
-    return raw_text, structured_md
+    structured = res.output_text.strip()
+    return raw, structured
 
 
-# ---------- Markdown tables parsing helpers ----------
-def markdown_table_to_df(md_table: str) -> pd.DataFrame | None:
-    """
-    Convert a Markdown table string to DataFrame. Returns None on failure.
-    """
+# ======================================
+# Markdown → DataFrame + flatten
+# ======================================
+def markdown_table_to_df(md_table: str):
     if "|" not in md_table:
         return None
-    # Clean leading/trailing pipes
-    lines = [ln.strip() for ln in md_table.strip().splitlines() if ln.strip()]
-    if len(lines) < 2:
-        return None
-    # Sometimes markdown tables include a separator row like |---|---|
-    # We'll rely on pandas with sep="|" and then clean separator columns.
     try:
-        df = pd.read_csv(StringIO("\n".join(lines)), sep="|", engine="python", header=0)
-        # Drop completely empty columns (from leading/trailing pipes)
+        # remove alignment rows like |---|---|
+        cleaned = [ln for ln in md_table.splitlines()
+                   if not re.match(r"^\s*\|?\s*[:-]+", ln)]
+        df = pd.read_csv(StringIO("\n".join(cleaned)),
+                         sep="|", engine="python", dtype=str, header=0)
         df = df.dropna(axis=1, how="all")
-        # Strip whitespace from headers & cells
         df.columns = [c.strip() for c in df.columns]
         for c in df.columns:
-            df[c] = df[c].map(lambda x: str(x).strip() if pd.notna(x) else x)
-        # Remove separator row if present (e.g., ---)
-        if df.shape[0] >= 1 and all(re.match(r"^\s*-{3,}\s*$", str(v)) for v in df.iloc[0].tolist()):
-            df = df.iloc[1:].reset_index(drop=True)
-        return df
-    except Exception:
+            df[c] = df[c].fillna("").str.strip()
+        # Always collapse to Field|Value
+        if len(df.columns) > 2:
+            df["Value"] = df[df.columns[1:]].agg(" | ".join, axis=1)
+            df = df[[df.columns[0], "Value"]]
+        elif len(df.columns) == 1:
+            df["Value"] = ""
+        df = df.rename(columns={df.columns[0]: "Field"})[["Field", "Value"]]
+        df = df[df["Field"] != ""]
+        return df.reset_index(drop=True)
+    except:
         return None
 
 
-def parse_structured_sections(structured_md: str) -> tuple[dict, dict]:
-    """
-    Parse the structured Markdown into:
-    - sections: dict[section_name] = DataFrame(Field, Value)
-    - flat_kv: flattened dict of all "Field: Value" pairs (last one wins)
-    """
-    sections: dict[str, pd.DataFrame] = {}
-    flat_kv: dict[str, str] = {}
-
-    chunks = re.split(r"^##\s+", structured_md, flags=re.MULTILINE)
-    for chunk in chunks:
-        chunk = chunk.strip()
-        if not chunk:
+def parse_structured_sections(structured_md: str):
+    sections = {}
+    flat = {}
+    blocks = re.split(r"^##\s+", structured_md, flags=re.MULTILINE)
+    for b in blocks:
+        if not b.strip():
             continue
-        lines = chunk.splitlines()
-        section_name = lines[0].strip()
-        table_md = "\n".join(lines[1:]).strip()
-        df = markdown_table_to_df(table_md)
-        if df is None or df.shape[1] < 2:
-            continue
-
-        # normalize columns to Field/Value
-        cols = list(df.columns)
-        # Heuristic: two-column table: first is Field, last is Value
-        field_col = cols[0]
-        value_col = cols[-1]
-
-        df = df.rename(columns={field_col: "Field", value_col: "Value"})
-        df = df[["Field", "Value"]]
-        # build flat map
-        for _, row in df.iterrows():
-            k = str(row["Field"]).strip()
-            v = (str(row["Value"]).strip()) if pd.notna(row["Value"]) else None
-            if k:
-                flat_kv[k] = v
-        sections[section_name] = df
-
-    return sections, flat_kv
+        lines = b.splitlines()
+        name = lines[0].strip()
+        md = "\n".join(lines[1:]).strip()
+        df = markdown_table_to_df(md)
+        if df is not None and not df.empty:
+            # flatten
+            for _, row in df.iterrows():
+                flat[row["Field"]] = row["Value"]
+            sections[name] = df
+    return sections, flat
 
 
-# ---------- AI fill for NULLs only ----------
-def ai_fill_missing(context: dict, target_fields: list[str]) -> dict:
-    """
-    Use OpenAI to fill only missing fields based on address, ATTOM, and (if available) scraped context.
-    We return a dict of guesses; caller will only use where value is currently null.
-    """
+# ======================================
+# AI helpers (fill/normalize)
+# ======================================
+def ai_fill_missing(context, keys):
     prompt = {
-        "task": "Fill only the missing values. If unknown, return null.",
-        "expected_fields": target_fields,
+        "task": "Fill only missing. If unknown return null.",
+        "fields": keys,
         "context": context
     }
     res = client.responses.create(model="gpt-4.1-mini", input=json.dumps(prompt))
-    data = extract_json_safe(res.output_text, {})
-    # Ensure only requested keys
-    guesses = {k: data.get(k) for k in target_fields}
-    return guesses
+    return extract_json_safe(res.output_text)
 
 
-# ---------- Field mapping / merge with priority ----------
-def build_identification(attom: dict, scraped: dict | None, ai: dict | None, harris: bool) -> dict:
+def normalize_field_names_with_ai(scraped_fields_dict: dict) -> dict:
     """
-    Build Identification table using priority:
-      Harris: SCRAPED > ATTOM > AI
-      Non-Harris: ATTOM > AI
+    Ask AI to map raw scraped keys to standardized field names.
+    Returns a new dict with normalized keys.
     """
+    prompt = {
+        "task": "Map each key to a clean, standardized field name for appraisal tables.",
+        "raw_keys": list(scraped_fields_dict.keys()),
+        "return_format": "JSON mapping of raw_key -> normalized_key"
+    }
+    res = client.responses.create(model="gpt-4.1-mini", input=json.dumps(prompt))
+    mapping = extract_json_safe(res.output_text, {})
+    rebuilt = {}
+    for k, v in scraped_fields_dict.items():
+        rebuilt[mapping.get(k, k)] = v
+    return rebuilt
+
+
+def final_ai_fix(identification, location, address, apn, attom, scraped):
+    missing_keys = [k for k in identification if not identification[k]] + \
+                   [k for k in location if not location[k]]
+
+    if not missing_keys:
+        return identification, location
+
+    payload = {
+        "task": "Fill only these fields; if unknown, return null.",
+        "address": address,
+        "apn": apn,
+        "attom": attom,
+        "scraped": scraped,
+        "fields_requested": missing_keys
+    }
+    res = client.responses.create(model="gpt-4.1-mini",
+                                  input=json.dumps(payload))
+    fix = extract_json_safe(res.output_text, {})
+
+    # apply only where missing; then remove nulls
+    for d in [identification, location]:
+        for k in list(d.keys()):
+            if not d[k]:
+                v = fix.get(k)
+                if v and str(v).strip().lower() != "null":
+                    d[k] = v
+                else:
+                    d.pop(k)
+    return identification, location
+
+
+# ======================================
+# BUILD TABLES (merge with priority)
+# ======================================
+def build_identification(attom, scraped, ai, harris):
     out = {f: None for f in IDENTIFICATION_FIELDS}
 
-    def pick(key_candidates):
-        # helper to pick from multiple scraped keys fallback
-        for k in key_candidates:
-            if k in (scraped or {}) and scraped.get(k):
-                return scraped.get(k)
+    def g(*xs):
+        for x in xs:
+            if scraped and scraped.get(x):
+                return scraped[x]
         return None
 
-    # Property ID (APN)
-    out["Property ID"] = (scraped or {}).get("Account Number") or attom.get("apn") or (ai or {}).get("Property ID")
+    out["Property ID"] = g("Account Number", "APN", "Property ID") or attom.get("apn") or ai.get("Property ID")
+    out["Owner Name"] = g("Owner", "Owner Name") or attom.get("owner_name") or ai.get("Owner Name")
+    out["Property Type"] = g("Property Type") or attom.get("property_type") or ai.get("Property Type")
+    out["Property Subtype"] = g("Property Subtype") or attom.get("property_sub_type") or ai.get("Property Subtype")
 
-    # Owner Name
     if harris:
-        out["Owner Name"] = pick(["Owner", "Owner Name"])
-    if not out["Owner Name"]:
-        out["Owner Name"] = attom.get("owner_name") or (ai or {}).get("Owner Name")
-
-    # Property Type / Subtype
-    if harris:
-        out["Property Type"] = pick(["Property Type"])
-        out["Property Subtype"] = pick(["Property Subtype"])
-    out["Property Type"] = out["Property Type"] or attom.get("property_type") or (ai or {}).get("Property Type")
-    out["Property Subtype"] = out["Property Subtype"] or attom.get("property_sub_type") or (ai or {}).get("Property Subtype")
-
-    # Ownership Type, Occupancy Status, Permit
-    if harris:
-        out["Ownership Type"] = pick(["Ownership Type", "Ownership"])
-        out["Occupancy Status"] = pick(["Occupancy Status", "Occupancy"])
-        out["Building Code / Permit ID"] = pick(["Permit", "Permit ID", "Building Permit", "Building Code / Permit ID"])
-
-    # Fill nulls with AI (but do not override ATTOM/SCRAPED)
-    if ai:
-        for k in out:
-            if not out[k]:
-                out[k] = ai.get(k)
+        out["Ownership Type"] = g("Ownership", "Ownership Type") or ai.get("Ownership Type")
+        out["Occupancy Status"] = g("Occupancy", "Occupancy Status") or ai.get("Occupancy Status")
+        out["Building Code / Permit ID"] = g("Permit", "Permit ID", "Building Permit") or ai.get("Building Code / Permit ID")
 
     return out
 
 
-def build_location(attom: dict, scraped: dict | None, ai: dict | None, harris: bool) -> dict:
-    """
-    Build Location table using priority:
-      Harris: SCRAPED > ATTOM > AI
-      Non-Harris: ATTOM > AI
-    """
+def build_location(attom, scraped, ai, harris):
     out = {f: None for f in LOCATION_FIELDS}
 
-    def sget(*names):
-        for n in names:
-            v = (scraped or {}).get(n)
-            if v:
-                return v
+    def g(*xs):
+        for x in xs:
+            if scraped and scraped.get(x):
+                return scraped[x]
         return None
 
     # ATTOM base
@@ -387,356 +380,113 @@ def build_location(attom: dict, scraped: dict | None, ai: dict | None, harris: b
     out["Postal Code"] = attom.get("zipcode")
     out["Latitude"] = attom.get("latitude")
     out["Longitude"] = attom.get("longitude")
+    out["Country"] = "USA"
 
-    # Harris overrides from scraped
     if harris:
-        out["Legal Description"] = sget("Legal Description", "Legal", "Legal Desc")
-        out["Neighborhood Name"] = sget("Neighborhood Name", "Neighborhood")
-        out["State Class Code"] = sget("State Class Code", "State Class", "Class Code")
-        out["Tax District"] = sget("Tax District", "Taxing Jurisdictions", "Jurisdictions")
-        out["Tax Code"] = sget("Tax Code", "Tax Code Area")
+        out["Legal Description"] = g("Legal Description", "Legal")
+        out["Neighborhood Name"] = g("Neighborhood Name", "Neighborhood")
+        out["State Class Code"] = g("State Class Code", "State Class")
+        out["Tax District"] = g("Tax District")
+        out["Tax Code"] = g("Tax Code")
+        # override situs details if present
+        out["Address Line 1"] = g("Situs Address", "Site Address") or out["Address Line 1"]
+        out["City"] = g("City") or out["City"]
+        out["Postal Code"] = g("Zip", "ZIP") or out["Postal Code"]
 
-        # Sometimes HCAD has address block values:
-        out["Address Line 1"] = sget("Site Address", "Situs Address") or out["Address Line 1"]
-        out["City"] = sget("City") or out["City"]
-        out["Postal Code"] = sget("Zip", "ZIP", "Zip Code") or out["Postal Code"]
-
-    # Fill remaining using AI (only where null)
-    if ai:
-        for k in out:
-            if not out[k]:
-                out[k] = ai.get(k)
-
+    # Fill any remaining from AI
+    for k, v in out.items():
+        if not v and ai:
+            out[k] = ai.get(k)
+    out["Country"] = "USA"
     return out
 
 
-def render_sections_area(structured_md: str):
-    """
-    Under the tabs, show “Additional Data From County Site” and
-    render each section as its own table.
-    """
+# ======================================
+# Show HCAD tables
+# ======================================
+def render_sections_area(md: str):
     st.markdown("### 📌 Additional Data From County Site")
-    sections, _ = parse_structured_sections(structured_md)
-    if not sections:
-        st.info("No structured sections parsed.")
-        return
-    for sec_name, df in sections.items():
-        # Cosmetic cleanup: ensure two columns present
-        if list(df.columns)[:2] != ["Field", "Value"]:
-            continue
-        st.markdown(f"#### 🔸 {sec_name}")
+    sections, _ = parse_structured_sections(md)
+    for sec, df in sections.items():
+        df.index = df.index + 1
+        df.index.name = "S.No"
+        st.markdown(f"#### 🔸 {sec}")
         st.dataframe(df, use_container_width=True)
 
 
-# =========================================
-# APP
-# =========================================
-address_input = st.text_input("Enter Address")
+# ======================================
+# FORM (Enter to Run)
+# ======================================
+with st.form("search_form", clear_on_submit=False):
+    address_input = st.text_input("Enter Address", placeholder="e.g., 8633 Eldridge Pkwy, Houston TX 77083")
+    submitted = st.form_submit_button("Run (Press Enter ↵)")
 
-if st.button("Run"):
+if submitted:
     if not address_input.strip():
-        st.error("Please enter an address.")
+        st.error("Address required.")
         st.stop()
 
-    with st.spinner("1) Normalizing address..."):
+    with st.spinner("1️⃣ Normalize address..."):
         normalized = normalize_address(address_input)
         normalized = enforce_user_zip(address_input, normalized)
 
-    with st.spinner("2) Fetching APN & County from ATTOM..."):
+    with st.spinner("2️⃣ Fetch ATTOM data..."):
         attom = fetch_attom(normalized)
 
-    if not attom:
-        st.error("ATTOM did not return data for this address.")
+    if not attom.get("apn"):
+        st.error("APN not found in ATTOM.")
         st.stop()
 
     county = (attom.get("county") or "").strip().lower()
-    apn = attom.get("apn")
+    apn = attom["apn"]
+    scraped_flat, structured_md = None, None
 
-    structured_md = None
-    flattened_scraped = None
+    if county == "harris":
+        with st.spinner("3️⃣ Harris County detected — Scraping & structuring HCAD..."):
+            _, structured_md = scrape_hcad_and_structure(apn)
+        # Parse and flatten
+        sections, scraped_flat = parse_structured_sections(structured_md)
+        # Normalize scraped field names with AI for better merging
+        with st.spinner("🧠 Normalizing scraped field names..."):
+            scraped_flat = normalize_field_names_with_ai(scraped_flat)
 
-    if county == "harris" and apn:
-        with st.spinner("3) Harris detected → Scraping HCAD & structuring data..."):
-            raw_text, structured_md = scrape_hcad_and_structure(apn)
-        # Build scraped dict (flat Key→Value map) for field fetching and merging
-        _, flattened_scraped = parse_structured_sections(structured_md)
+    # Pre-fill AI for missing fields (context)
+    with st.spinner("4️⃣ AI pre-fill (missing only)..."):
+        ai_data = ai_fill_missing(
+            {"address": normalized, "apn": apn, "attom": attom, "scraped": scraped_flat},
+            ALL_FIELDS
+        )
 
-    # 4) Field fetching + 5) AI fill (NULLs only), with conflicts resolved
-    context_for_ai = {
-        "address": normalized,
-        "attom": attom,
-        "scraped": flattened_scraped or {},
-        "notes": "Fill only missing keys; if unknown use null."
-    }
-    ai_guesses = ai_fill_missing(context_for_ai, ALL_FIELDS)
+    harris = (county == "harris") and (structured_md is not None)
 
-    # Build final Identification and Location with priorities per county case
-    is_harris = county == "harris" and structured_md is not None
+    with st.spinner("5️⃣ Merge data with priority..."):
+        identification = build_identification(attom, scraped_flat, ai_data, harris)
+        location = build_location(attom, scraped_flat, ai_data, harris)
 
-    identification = build_identification(attom, flattened_scraped, ai_guesses, harris=is_harris)
-    location = build_location(attom, flattened_scraped, ai_guesses, harris=is_harris)
+    # Final AI fix & remove null fields
+    with st.spinner("6️⃣ Final AI fix & cleanup..."):
+        identification, location = final_ai_fix(
+            identification, location,
+            normalized, apn, attom, scraped_flat
+        )
 
-    # 6) UI — Tabs first; then Additional County data (for Harris)
-    tab_id, tab_loc = st.tabs(["🆔 Identification", "📍 Location"])
-
-    with tab_id:
-        st.dataframe(pd.DataFrame(identification.items(), columns=["Field", "Value"]),
-                     use_container_width=True)
-
-    with tab_loc:
-        st.dataframe(pd.DataFrame(location.items(), columns=["Field", "Value"]),
-                     use_container_width=True)
-
-    if is_harris and structured_md:
-        st.markdown("---")
-        render_sections_area(structured_md)
-    else:
-        st.info("ℹ️ County is not Harris — showing ATTOM + AI-based Identification & Location only.")
-import os
-import time
-import re
-import json
-import requests
-import pandas as pd
-import streamlit as st
-from openai import OpenAI
-from dotenv import load_dotenv
-from selenium import webdriver
-from selenium.webdriver.common.by import By
-from selenium.webdriver.chrome.service import Service
-from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
-from webdriver_manager.chrome import ChromeDriverManager
-
-
-# =================================================
-# ✅ Load Secrets
-# =================================================
-load_dotenv()
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-ATTOM_API_KEY = os.getenv("ATTOM_API_KEY")
-
-client = OpenAI(api_key=OPENAI_API_KEY)
-
-
-# =================================================
-# ✅ Streamlit UI
-# =================================================
-st.set_page_config(page_title="Revalix+", page_icon="🏠")
-st.title("🏠 Revalix Property Intelligence System")
-
-
-# =================================================
-# ✅ Helper Functions
-# =================================================
-
-def extract_json_safe(text):
-    match = re.search(r"\{.*\}", text, re.S)
-    if match:
-        try:
-            return json.loads(match.group(0))
-        except:
-            return {}
-    return {}
-
-
-# ✅ 1️⃣ Normalize Address
-def normalize_address(address: str):
-    prompt = f"""
-    Return only JSON:
-    {{
-        "corrected_address": "<FULL NORMALIZED USPS FORMAT>"
-    }}
-    Address: "{address}"
-    """
-    res = client.responses.create(model="gpt-4.1-mini", input=prompt)
-    data = extract_json_safe(res.output_text)
-    return data.get("corrected_address", address)
-
-
-# ✅ 2️⃣ ATTOM Data
-def fetch_attom(address: str):
-    try:
-        street, rest = address.split(",", 1)
-        city, st_zip = rest.rsplit(",", 1)
-        state, zipcode = st_zip.strip().split()
-    except:
-        return {}
-    url = "https://api.gateway.attomdata.com/propertyapi/v1.0.0/property/basicprofile"
-    headers = {"apikey": ATTOM_API_KEY}
-    params = {"address1": street.strip(),
-              "address2": f"{city.strip()}, {state} {zipcode}"}
-
-    r = requests.get(url, headers=headers, params=params)
-    props = r.json().get("property", [])
-    if not props: return {}
-
-    p = props[0]
-    return {
-        "apn": p.get("identifier", {}).get("apn"),
-        "street": p.get("address", {}).get("line1"),
-        "city": p.get("address", {}).get("locality"),
-        "county": p.get("area", {}).get("countrySecSubd"),
-        "state": p.get("address", {}).get("countrySubd"),
-        "zip": p.get("address", {}).get("postal1"),
-        "lat": p.get("location", {}).get("latitude"),
-        "lon": p.get("location", {}).get("longitude"),
-        "property_type": p.get("summary", {}).get("propSubType"),
-        "property_subtype": p.get("summary", {}).get("propType"),
-    }
-
-
-# ✅ 3️⃣ HCAD Scraping
-def scrape_hcad(apn):
-    URL = "https://arcweb.hcad.org/parcel-viewer-v2.0/"
-
-    chrome_options = Options()
-    chrome_options.add_argument("--start-maximized")
-    driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=chrome_options)
-    wait = WebDriverWait(driver, 60)
-
-    driver.get(URL)
-    time.sleep(6)
-
-    try:
-        wait.until(EC.element_to_be_clickable(
-            (By.XPATH, '//*[@id="mySurveyModal"]/div/span'))).click()
-    except: pass
-
-    search_box = wait.until(EC.visibility_of_element_located(
-        (By.CSS_SELECTOR, "input.esri-input")))
-    search_box.clear()
-    search_box.send_keys(apn)
-
-    search_btn = wait.until(EC.element_to_be_clickable(
-        (By.XPATH, "//button[contains(@class,'esri-search__submit-button')]")))
-    driver.execute_script("arguments[0].click();", search_btn)
-
-    wait.until(EC.presence_of_element_located(
-        (By.CSS_SELECTOR, ".esri-popup__main-container")))
-
-    result_link = wait.until(EC.element_to_be_clickable(
-        (By.CSS_SELECTOR, "#popupTable tbody tr:nth-child(1) td:nth-child(2) a")))
-    driver.execute_script("arguments[0].click();", result_link)
-    time.sleep(3)
-    driver.switch_to.window(driver.window_handles[-1])
-
-    # ✅ Scroll
-    last = 0
-    while True:
-        driver.execute_script("window.scrollBy(0,2000)")
-        time.sleep(1.2)
-        nh = driver.execute_script("return document.body.scrollHeight")
-        if nh == last: break
-        last = nh
-
-    raw = driver.execute_script("return document.body.innerText")
-    driver.quit()
-
-    # ✅ 4️⃣ Send text to OpenAI for full structured tables
-    prompt = f"""
-    Convert all text into Markdown tables:
-    - Each section header must start with "##"
-    - Every data point must appear, no summarizing
-    - Table: Field | Value
-    Raw Data:
-    \"\"\"{raw}\"\"\"
-    """
-
-    resp = client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0,
-    )
-    structured = resp.choices[0].message.content.strip()
-    return raw, structured
-
-
-# ✅ New UI Sections Table Generator
-def show_data_section(title, data_dict):
-    st.markdown(f"### 🔹 {title}")
-    st.dataframe(pd.DataFrame(data_dict.items(),
-                              columns=["Field", "Value"]),
-                 use_container_width=True)
-
-
-# =================================================
-# ✅ MAIN EXECUTION
-# =================================================
-address = st.text_input("Enter Property Address")
-
-if st.button("Start"):
-    if not address: st.stop()
-
-    with st.spinner("Normalizing Address…"):
-        normalized = normalize_address(address)
-
-    with st.spinner("Fetching APN + Base Property Data…"):
-        attom = fetch_attom(normalized)
-
-    apn = attom.get("apn")
-
-    if not apn:
-        st.error("APN not found — Cannot process HCAD")
-        st.stop()
-
-    with st.spinner("Scraping County Property Records…"):
-        raw, structured = scrape_hcad(apn)
-
-    # ✅ Field Filling Engine: merge HCAD + ATTOM + AI logic
-    final = attom.copy()  # ATTOM base
-
-    # ✅ Extract Legal From Scraped Text (if available)
-    legal_match = re.search(r"Legal Description.*", raw)
-    if legal_match:
-        final["legal_description"] = legal_match.group(0).split(":")[-1].strip()
-
-    # ✅ First Display → Tabs
+    # UI Tabs
     tab1, tab2 = st.tabs(["🆔 Identification", "📍 Location"])
 
     with tab1:
-        show_data_section("Identification", {
-            "Property ID": apn,
-            "Property Type": final.get("property_type"),
-            "Property Subtype": final.get("property_subtype"),
-            "Ownership Type": None,
-            "Occupancy Status": None,
-            "Building Code/Permit ID": None
-        })
+        df = pd.DataFrame(identification.items(), columns=["Field", "Value"])
+        df.index = df.index + 1
+        df.index.name = "S.No"
+        st.dataframe(df, use_container_width=True)
 
     with tab2:
-        show_data_section("Location", {
-            "Address Line 1": final.get("street"),
-            "City": final.get("city"),
-            "County": final.get("county"),
-            "State": final.get("state"),
-            "Postal Code": final.get("zip"),
-            "Latitude": final.get("lat"),
-            "Longitude": final.get("lon"),
-            "Legal Description": final.get("legal_description")
-        })
+        df = pd.DataFrame(location.items(), columns=["Field", "Value"])
+        df.index = df.index + 1
+        df.index.name = "S.No"
+        st.dataframe(df, use_container_width=True)
 
-    # ✅ Additional HCAD Data Section
-    st.markdown("---")
-    st.subheader("📌 Additional Data (From County Site)")
-
-    # ✅ Display Structured Tables by section
-    sections = re.split(r"^## ", structured, flags=re.MULTILINE)
-    for sec in sections:
-        if not sec.strip(): continue
-        lines = sec.split("\n")
-        header = lines[0].strip()
-        data_lines = "\n".join(lines[1:]).strip()
-        if "|" not in data_lines: continue
-        try:
-            df = pd.read_csv(pd.io.common.StringIO(data_lines),
-                             sep="|", engine="python")
-            df = df.dropna(axis=1, how='all')
-            df.columns = df.columns.str.strip()
-            df = df.applymap(lambda x: str(x).strip() if isinstance(x, str) else x)
-            st.markdown(f"### 🔸 {header}")
-            st.dataframe(df, use_container_width=True)
-        except:
-            st.text_area(f"{header} Data", data_lines, height=250)
-
+    if harris:
+        st.markdown("---")
+        render_sections_area(structured_md)
+    else:
+        st.info("ℹ️ Non-Harris: Only ATTOM + AI-based Identification & Location shown.")
