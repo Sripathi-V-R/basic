@@ -20,25 +20,21 @@ FIELDS = [
     "country", "latitude", "longitude", "property_type", "property_sub_type"
 ]
 
-# ✅ STEP 1 — Correct messy address
+
+# ✅ STEP 1 — Correct messy address with AI
 def clean_address_with_openai(address: str):
     prompt = f"""
-    You are an expert in correcting U.S. property addresses.
-
-    Convert the following messy/incomplete input into a correct,
-    standardized USPS-compliant full address:
+    Fix and standardize this U.S. address into a valid USPS-compliant address:
 
     "{address}"
 
-    Return ONLY this JSON:
+    Ensure output format: Street, City, State ZIP
+    Validate ZIP belongs geographically to city/street. Correct if mismatched.
+
+    Return ONLY JSON:
     {{
         "corrected_address": "<FULL_ADDRESS>"
     }}
-
-    Rules:
-    - Ensure format: Street, City, State ZIP
-    - NEVER return null values
-    - No additional keys or comments
     """
 
     res = client.responses.create(
@@ -56,14 +52,13 @@ def clean_address_with_openai(address: str):
         return parsed.get("corrected_address", address)
 
 
-# ✅ STEP 2 — Extract Property Fields (AI fallback)
+# ✅ STEP 2 — Extract as fallback using OpenAI
 def extract_with_openai(address: str):
     prompt = f"""
-    Extract property information for this U.S. address:
-
+    Extract property info for this U.S. address:
     "{address}"
 
-    Return ONLY this JSON structure, lowercase keys:
+    Only return this JSON:
     {{
         "apn": null,
         "street_name": null,
@@ -93,38 +88,42 @@ def extract_with_openai(address: str):
         return json.loads(text[start:end])
 
 
-# ✅ STEP 3 — Split + Pass Correct Params to ATTOM ✅
-def get_attom_data(address: str):
+# ✅ STEP 3 — Split + ATTOM API
+def get_attom_data(corrected_address: str):
     try:
-        street, rest = address.split(",", 1)
+        street_address, rest = corrected_address.split(",", 1)
+        street_address = street_address.strip()
+
         rest = rest.strip()
         city, state_zip = rest.rsplit(",", 1)
-        state, zipcode = state_zip.strip().split()
-    except:
+
+        city = city.strip()
+        state_zip = state_zip.strip()
+        state, zipcode = state_zip.split()
+
+        state = state.strip()
+        zipcode = zipcode.strip()
+    except Exception:
+        st.warning("⚠️ Address parsing issue for ATTOM lookup.")
         return {}
 
     url = "https://api.gateway.attomdata.com/propertyapi/v1.0.0/property/basicprofile"
-    
-    headers = {
-        "apikey": ATTOM_API_KEY,
-        "accept": "application/json"
-    }
-
+    headers = {"apikey": ATTOM_API_KEY, "accept": "application/json"}
     params = {
-        "address1": street.strip(),
-        "address2": f"{city.strip()}, {state.strip()} {zipcode.strip()}"
+        "address1": street_address,
+        "address2": f"{city}, {state} {zipcode}"
     }
 
     r = requests.get(url, headers=headers, params=params)
-
     if r.status_code != 200:
         return {}
 
     data = r.json()
-    if not data.get("property"):
+    properties = data.get("property", [])
+    if not properties:
         return {}
 
-    prop = data["property"][0]
+    prop = properties[0]
 
     return {
         "apn": prop.get("identifier", {}).get("apn"),
@@ -141,28 +140,27 @@ def get_attom_data(address: str):
     }
 
 
-# ✅ STEP 4 — Merge AI + ATTOM Data
+# ✅ STEP 4 — Merge ATTOM + AI
 def merge_data(ai_data, attom_data):
     final = {}
     for key in FIELDS:
-        value = attom_data.get(key) or ai_data.get(key)
-        final[key] = value
+        final[key] = attom_data.get(key) or ai_data.get(key)
     return final
 
 
-# ✅ User Input UI
+# ✅ UI Actions
 address_input = st.text_input("Enter Property Address:")
 
 if st.button("Find Property"):
     if not address_input.strip():
-        st.error("Please enter a valid U.S. address.")
+        st.error("❌ Please enter a valid U.S. address.")
     else:
-        with st.spinner("Correcting address..."):
+        with st.spinner("🧠 Correcting address..."):
             corrected_address = clean_address_with_openai(address_input)
 
         st.info(f"📍 Corrected Address: **{corrected_address}**")
 
-        with st.spinner("Fetching property details..."):
+        with st.spinner("🔍 Fetching property data..."):
             ai_data = extract_with_openai(corrected_address)
             attom_data = get_attom_data(corrected_address)
             final_data = merge_data(ai_data, attom_data)
