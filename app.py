@@ -84,7 +84,7 @@ def get_attom_data(address: str):
     r = requests.get(url, headers=headers, params=params)
 
     if r.status_code != 200:
-        st.error(f"ATTOM API Error: {r.status_code}")
+        st.error(f"Error: {r.status_code}")
         return {}
 
     properties = r.json().get("property", [])
@@ -145,4 +145,5 @@ if st.button("Find Property"):
         df = pd.DataFrame(final.items(), columns=["Field", "Value"])
         st.success("✅ Data Verified Successfully")
         st.dataframe(df, use_container_width=True)
+
 
