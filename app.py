@@ -24,8 +24,13 @@ from webdriver_manager.chrome import ChromeDriverManager
 # Setup
 # =========================================
 load_dotenv()
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-ATTOM_API_KEY = os.getenv("ATTOM_API_KEY")
+
+if "OPENAI_API_KEY" in st.secrets:
+    OPENAI_API_KEY = st.secrets["OPENAI_API_KEY"]
+    ATTOM_API_KEY = st.secrets["ATTOM_API_KEY"]
+else:
+    OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+    ATTOM_API_KEY = os.getenv("ATTOM_API_KEY")
 client = OpenAI(api_key=OPENAI_API_KEY)
 
 st.set_page_config(page_title="Revalix+ ", page_icon="🏠", layout="wide")
@@ -490,3 +495,4 @@ if submitted:
         render_sections_area(structured_md)
     else:
         st.info("ℹ️ Non-Harris: Only ATTOM + AI-based Identification & Location shown.")
+
