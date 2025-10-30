@@ -20,17 +20,27 @@ from selenium.webdriver.support import expected_conditions as EC
 from webdriver_manager.chrome import ChromeDriverManager
 
 
-# =========================================
-# Setup
-# =========================================
-load_dotenv()
+# Load .env if available (local or from Render Secret File)
+load_dotenv("/etc/secrets/.env")  # path Render mounts secret files to
+load_dotenv()  # fallback local .env if running locally
 
-if "OPENAI_API_KEY" in st.secrets:
-    OPENAI_API_KEY = st.secrets["OPENAI_API_KEY"]
-    ATTOM_API_KEY = st.secrets["ATTOM_API_KEY"]
-else:
-    OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-    ATTOM_API_KEY = os.getenv("ATTOM_API_KEY")
+# Try to get keys safely
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+ATTOM_API_KEY = os.getenv("ATTOM_API_KEY")
+
+# Optional fallback (for Streamlit Cloud only)
+if not OPENAI_API_KEY or not ATTOM_API_KEY:
+    try:
+        OPENAI_API_KEY = st.secrets["OPENAI_API_KEY"]
+        ATTOM_API_KEY = st.secrets["ATTOM_API_KEY"]
+    except Exception:
+        pass
+
+if not OPENAI_API_KEY or not ATTOM_API_KEY:
+    st.error("❌ Missing API keys! Please check Render Secret File or Environment Variables.")
+    st.stop()
+
+from openai import OpenAI
 client = OpenAI(api_key=OPENAI_API_KEY)
 
 st.set_page_config(page_title="Revalix+ ", page_icon="🏠", layout="wide")
@@ -495,4 +505,5 @@ if submitted:
         render_sections_area(structured_md)
     else:
         st.info("ℹ️ Non-Harris: Only ATTOM + AI-based Identification & Location shown.")
+
 
