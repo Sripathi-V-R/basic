@@ -160,8 +160,14 @@ def clean_garbage(text: str) -> str:
 def scrape_hcad_and_structure(apn: str):
     URL = "https://arcweb.hcad.org/parcel-viewer-v2.0/"
     chrome_options = Options()
-    chrome_options.add_argument("--start-maximized")
+    chrome_options.add_argument("--headless")
+    chrome_options.add_argument("--no-sandbox")
+    chrome_options.add_argument("--disable-dev-shm-usage")
+    chrome_options.add_argument("--disable-gpu")
+    chrome_options.add_argument("--disable-extensions")
     chrome_options.add_argument("--disable-popup-blocking")
+    chrome_options.add_argument("--window-size=1920,1080")
+    chrome_options.binary_location = os.getenv("CHROME_BIN", "/usr/bin/google-chrome")
     driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()),
                               options=chrome_options)
     wait = WebDriverWait(driver, 60)
@@ -505,5 +511,6 @@ if submitted:
         render_sections_area(structured_md)
     else:
         st.info("ℹ️ Non-Harris: Only ATTOM + AI-based Identification & Location shown.")
+
 
 
