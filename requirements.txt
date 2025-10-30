@@ -1,11 +1,12 @@
 streamlit
-pandas
-requests
+selenium
 python-dotenv
-openai>=1.0.0
+openai
+requests
+pandas
 webdriver-manager
-selenium==4.20.0
-chromedriver-autoinstaller
+
+
 
 
 
